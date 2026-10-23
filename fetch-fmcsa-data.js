@@ -1,18 +1,21 @@
 // fetch-fmcsa-data.js
-// Daily job: finds carriers whose operating authority is ACTIVE in FMCSA's
-// "Motus Carrier" daily-difference file, then fills in company name, phone,
-// email, city, fleet size from FMCSA's Company Census file (matched by DOT #).
+// Finds carriers whose operating authority was newly GRANTED on a given day
+// (FMCSA "Motus AuthHist - All With History"), then fills in company name,
+// phone, email, city, fleet size from the Company Census (matched by DOT #).
 //
-// Motus Carrier (nakq-58th): authority records - often has blank names/phones.
-// Company Census (az4n-8mr2): full carrier profiles.
+// Each carrier is saved under the day its authority was granted, so the
+// "Registered" column is the real grant date. Every run re-checks the last
+// few days to catch late-posted records. If old-format data is found, it is
+// removed and the last 30 days are rebuilt automatically.
 
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const MOTUS_DATASET = 'nakq-58th';
-const CENSUS_DATASET = 'az4n-8mr2';
+const AUTH_DATASET = 'yu5v-wbh6';     // Motus AuthHist - All With History
+const CENSUS_DATASET = 'az4n-8mr2';   // Company Census File
 const APP_TOKEN = process.env.SOCRATA_APP_TOKEN || '';
+const DATA_VERSION = 2;
 
 function getJson(url, attempts = 3) {
   return new Promise((resolve, reject) => {
@@ -47,16 +50,38 @@ function formatPhone(raw) {
   return raw || '';
 }
 
+function shiftDate(isoDate, days) {
+  const d = new Date(isoDate + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() - days);
+  return d.toISOString().slice(0, 10);
+}
+
+// All authorities GRANTED (and currently Active in the record) on one day.
+async function fetchGrantsForDate(iso) {
+  const compact = iso.replace(/-/g, '');
+  const rest = `upper(reason)='GRANTED' AND upper(op_auth_status)='ACTIVE'`;
+  let rows = await getJson(socrataUrl(AUTH_DATASET, {
+    $where: `status_change_date='${compact}' AND ${rest}`, $limit: 5000
+  }));
+  if (!Array.isArray(rows)) {
+    // column might be numeric - retry without quotes
+    rows = await getJson(socrataUrl(AUTH_DATASET, {
+      $where: `status_change_date=${compact} AND ${rest}`, $limit: 5000
+    }));
+  }
+  if (!Array.isArray(rows)) throw new Error('AuthHist error: ' + JSON.stringify(rows).slice(0, 300));
+  return rows;
+}
+
 async function fetchCensus(dots) {
   const out = {};
-  const select = 'dot_number,legal_name,phone,email_address,phy_city,phy_state,power_units,add_date';
+  const select = 'dot_number,legal_name,phone,email_address,phy_city,phy_state,power_units,docket1prefix,docket1,docket1_status_code';
   for (let i = 0; i < dots.length; i += 80) {
     const chunk = dots.slice(i, i + 80);
     let rows = await getJson(socrataUrl(CENSUS_DATASET, {
       $select: select, $where: `dot_number in (${chunk.join(',')})`, $limit: 1000
     }));
     if (!Array.isArray(rows)) {
-      // dot_number may be stored as text - retry with quotes
       rows = await getJson(socrataUrl(CENSUS_DATASET, {
         $select: select, $where: `dot_number in (${chunk.map(d => `'${d}'`).join(',')})`, $limit: 1000
       }));
@@ -70,60 +95,70 @@ async function fetchCensus(dots) {
   return out;
 }
 
-async function run(targetDate) {
-  console.log(`Fetching Motus Carrier daily file for ${targetDate}...`);
-  const rows = await getJson(socrataUrl(MOTUS_DATASET, { $limit: 50000 }));
-  if (!Array.isArray(rows)) throw new Error('Motus response error: ' + JSON.stringify(rows).slice(0, 300));
-  console.log(`Motus rows: ${rows.length}`);
+async function run(today) {
+  const outFile = path.join(__dirname, 'data', 'carriers.json');
+  let existing = fs.existsSync(outFile) ? JSON.parse(fs.readFileSync(outFile)) : [];
 
-  const statusCounts = {};
-  rows.forEach(r => {
-    const s = (r.op_auth_status || '(blank)').trim().toUpperCase();
-    statusCounts[s] = (statusCounts[s] || 0) + 1;
-  });
-  console.log('Status values found:', JSON.stringify(statusCounts));
-
-  const seen = new Set();
-  const candidates = [];
-  for (const r of rows) {
-    const status = (r.op_auth_status || '').trim().toUpperCase();
-    const docket = (r.docket_number || '').trim().toUpperCase();
-    if (!docket.startsWith('MC')) continue;                 // carriers only (no FF/MX)
-    if (status !== 'ACTIVE' && status !== 'A') continue;    // exact match, not "INACTIVE"
-    if (seen.has(docket)) continue;                         // one row per MC number
-    const dot = parseInt(r.usdot_number, 10);
-    if (!dot) continue;
-    seen.add(docket);
-    candidates.push({ docket, dot });
+  const hasOldFormat = existing.some(c => c.v !== DATA_VERSION);
+  if (hasOldFormat) {
+    existing = existing.filter(c => c.v === DATA_VERSION);
+    console.log('Old-format records removed. Rebuilding the last 30 days.');
   }
-  console.log(`Active MC carriers in file: ${candidates.length}`);
+  const lookback = hasOldFormat ? 30 : 3;
+  const dates = Array.from({ length: lookback + 1 }, (_, i) => shiftDate(today, i));
+  console.log(`Checking grant dates: ${dates[dates.length - 1]} to ${dates[0]}`);
 
-  const census = await fetchCensus(candidates.map(c => c.dot));
+  const typeCounts = {};
+  const seenDot = new Set();
+  const grants = [];
+  for (const iso of dates) {
+    const rows = await fetchGrantsForDate(iso);
+    let kept = 0;
+    for (const r of rows) {
+      const type = (r.op_auth_type || '').trim();
+      typeCounts[type] = (typeCounts[type] || 0) + 1;
+      const docket = (r.docket_number || '').trim().toUpperCase();
+      if (!docket.startsWith('MC')) continue;                       // carriers only
+      if (!type.toLowerCase().includes('motor carrier')) continue;  // not brokers
+      const dot = parseInt(r.usdot_number, 10);
+      if (!dot || seenDot.has(dot)) continue;                       // one row per carrier
+      seenDot.add(dot);
+      grants.push({ docket, dot, date: iso });
+      kept++;
+    }
+    console.log(`${iso}: ${rows.length} grants in file, ${kept} motor carriers kept`);
+  }
+  console.log('Authority types seen:', JSON.stringify(typeCounts));
+
+  const census = await fetchCensus(grants.map(g => g.dot));
 
   const mapped = [];
-  for (const c of candidates) {
-    const info = census[String(c.dot)];
-    if (!info || !info.legal_name) continue;                // can't verify -> skip
+  let noCensus = 0, inactive = 0;
+  for (const g of grants) {
+    const info = census[String(g.dot)];
+    if (!info || !info.legal_name) { noCensus++; continue; }
+    const sameMc = (info.docket1prefix || '').toUpperCase() === 'MC' &&
+      String(info.docket1 || '').replace(/\D/g, '') === g.docket.replace(/\D/g, '');
+    const code = (info.docket1_status_code || '').toUpperCase();
+    if (sameMc && code.startsWith('I')) { inactive++; continue; }   // no longer active
     mapped.push({
       company_name: info.legal_name,
       phone: formatPhone(info.phone),
       email: info.email_address || '',
-      dot_number: String(c.dot),
-      mc_number: c.docket,
+      dot_number: String(g.dot),
+      mc_number: g.docket,
       city: info.phy_city || '',
       state: info.phy_state || '',
       status: 'Active',
       equipment_count: info.power_units || 0,
-      registration_date: targetDate
+      registration_date: g.date,
+      v: DATA_VERSION
     });
   }
-  console.log(`Matched with census (saved): ${mapped.length}`);
+  console.log(`Saved ${mapped.length} carriers (${noCensus} skipped: no census match, ${inactive} skipped: not active now)`);
 
-  const outFile = path.join(__dirname, 'data', 'carriers.json');
-  const existing = fs.existsSync(outFile) ? JSON.parse(fs.readFileSync(outFile)) : [];
-  const merged = [...existing.filter(c => c.registration_date !== targetDate), ...mapped];
+  const merged = [...existing.filter(c => !dates.includes(c.registration_date)), ...mapped];
   fs.writeFileSync(outFile, JSON.stringify(merged, null, 2));
-  console.log(`Saved ${mapped.length} carriers for ${targetDate}`);
 }
 
 const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
