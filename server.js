@@ -93,6 +93,7 @@ function applyTier(rows, tier) {
     return {
       company_name: '••••••••••••••',
       phone: '•••-•••-••••',
+      email: '••••••@••••••.•••',
       dot_number: '•••••••',
       mc_number: '•••••••',
       city: '••••••',
