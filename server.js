@@ -106,7 +106,7 @@ function applyTier(rows, tier) {
 }
 
 function toCSV(rows) {
-  const headers = ['company_name','phone','dot_number','mc_number','city','state','status','equipment_count','registration_date'];
+   const headers = ['company_name','phone','email','dot_number','mc_number','city','state','status','equipment_count','registration_date'];
   const lines = [headers.join(',')];
   for (const r of rows) {
     lines.push(headers.map(h => `"${String(r[h] ?? '').replace(/"/g, '""')}"`).join(','));
