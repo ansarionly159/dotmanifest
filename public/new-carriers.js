@@ -141,6 +141,7 @@ function render(data) {
     <tr class="${r.locked ? 'locked' : ''}">
       <td>${r.company_name}</td>
       <td>${r.phone}</td>
+      <td>${r.email || '—'}</td>
       <td>${r.dot_number}</td>
       <td>${r.mc_number}</td>
       <td>${r.city}, ${r.state}</td>
